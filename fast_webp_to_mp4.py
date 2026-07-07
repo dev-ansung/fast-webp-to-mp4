@@ -2,6 +2,7 @@ import argparse
 import subprocess
 import sys
 import threading
+import time
 import queue
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -220,6 +221,7 @@ class FfmpegPipe:
 
 def convert_one(src_path, output_path, use_hw, fps_override=None, bitrate="5000k", codec="h264"):
     """Convert a single animated webp file to mp4, streaming frames to ffmpeg via stdin."""
+    start = time.monotonic()
     img = Image.open(src_path)
     width, height = img.size
 
@@ -234,8 +236,11 @@ def convert_one(src_path, output_path, use_hw, fps_override=None, bitrate="5000k
         pipe.write(frame_bytes)
 
     ok, stderr = pipe.close()
-    if not ok:
-        print(f"  ffmpeg failed: {stderr}", file=sys.stderr)
+    elapsed = time.monotonic() - start
+    if ok:
+        print(f"  {src_path.name}: done in {elapsed:.2f}s")
+    else:
+        print(f"  {src_path.name}: failed after {elapsed:.2f}s: {stderr}", file=sys.stderr)
     return ok
 
 def should_write(output_path, force, non_interactive):
@@ -366,11 +371,13 @@ def main():
     if args.jobs > 1:
         print(f"Running up to {args.jobs} conversions in parallel.")
 
+    batch_start = time.monotonic()
     to_convert, skipped = plan_batch(sources, input_root, args)
     results = run_batch(to_convert, use_hw, args)
+    batch_elapsed = time.monotonic() - batch_start
 
     failures = sum(1 for ok in results if not ok)
-    print(f"Done. {len(results) - failures} converted, {skipped} skipped, {failures} failed.")
+    print(f"Done in {batch_elapsed:.2f}s. {len(results) - failures} converted, {skipped} skipped, {failures} failed.")
     sys.exit(1 if failures else 0)
 
 if __name__ == "__main__":
