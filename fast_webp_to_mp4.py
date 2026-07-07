@@ -18,10 +18,33 @@ def has_encoder(name):
     result = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True)
     return name in result.stdout
 
+def frame_durations_ms(img):
+    """
+    Each frame's declared duration in milliseconds, or None for any frame
+    that has no timing metadata at all.
+
+    >>> class FakeFrame:
+    ...     def __init__(self, duration): self.info = {"duration": duration}
+    >>> class FakeImg:
+    ...     n_frames = 2
+    ...     def __init__(self): self._frames = [FakeFrame(40), FakeFrame(0)]
+    ...     def seek(self, i): self._cur = self._frames[i]
+    ...     @property
+    ...     def info(self): return self._cur.info
+    >>> frame_durations_ms(FakeImg())
+    [40, None]
+    """
+    durations = []
+    for i in range(getattr(img, "n_frames", 1)):
+        img.seek(i)
+        durations.append(img.info.get("duration") or None)
+    return durations
+
 def frame_rate(img):
     """
-    Average fps across all frames' declared durations, falling back to 25fps
-    for frames (or whole files) with no timing metadata.
+    Average fps across all frames' declared durations, and whether that
+    timing metadata actually existed (vs. every frame missing it, forcing
+    a 25fps fallback).
 
     >>> class FakeFrame:
     ...     def __init__(self, duration): self.info = {"duration": duration}
@@ -32,30 +55,47 @@ def frame_rate(img):
     ...     @property
     ...     def info(self): return self._cur.info
     >>> frame_rate(FakeImg())
-    25.0
+    (25.0, True)
+
+    >>> class NoTimingImg:
+    ...     n_frames = 2
+    ...     def seek(self, i): pass
+    ...     info = {}
+    >>> frame_rate(NoTimingImg())
+    (25.0, False)
     """
-    durations = []
-    for i in range(getattr(img, "n_frames", 1)):
-        img.seek(i)
-        durations.append(img.info.get("duration") or 40)
-    avg_ms = sum(durations) / len(durations)
-    return 1000.0 / avg_ms if avg_ms > 0 else 25.0
+    durations = frame_durations_ms(img)
+    has_timing = any(d is not None for d in durations)
+    avg_ms = sum(d or 40 for d in durations) / len(durations)
+    fps = 1000.0 / avg_ms if avg_ms > 0 else 25.0
+    return fps, has_timing
 
 def resolve_fps(img, fps_override=None):
     """
-    Output fps: the override if given, otherwise derived from the webp's
-    own frame timing.
+    Output fps and whether it came from an override, the webp's own
+    timing, or the no-timing-metadata fallback.
 
     >>> class FakeImg:
     ...     n_frames = 1
     ...     def seek(self, i): pass
     ...     info = {"duration": 40}
     >>> resolve_fps(FakeImg())
-    25.0
+    (25.0, 'webp frame timing')
     >>> resolve_fps(FakeImg(), fps_override=10.0)
-    10.0
+    (10.0, '--fps override')
+
+    >>> class NoTimingImg:
+    ...     n_frames = 1
+    ...     def seek(self, i): pass
+    ...     info = {}
+    >>> resolve_fps(NoTimingImg())
+    (25.0, 'default')
     """
-    return fps_override if fps_override else frame_rate(img)
+    if fps_override:
+        return fps_override, "--fps override"
+    fps, has_timing = frame_rate(img)
+    source = "webp frame timing" if has_timing else "default"
+    return fps, source
 
 def resolve_encoder(use_hw, codec):
     """
@@ -93,7 +133,7 @@ class EncodingPlan:
     function above; this just carries the results.
     """
     fps: float
-    fps_is_override: bool
+    fps_source: str
     encoder: str
     use_hw: bool
     bitrate: str
@@ -101,25 +141,24 @@ class EncodingPlan:
 
     @classmethod
     def resolve(cls, img, use_hw, codec, bitrate, fps_override=None):
+        fps, fps_source = resolve_fps(img, fps_override=fps_override)
         return cls(
-            fps=resolve_fps(img, fps_override=fps_override),
-            fps_is_override=bool(fps_override),
+            fps=fps, fps_source=fps_source,
             encoder=resolve_encoder(use_hw, codec),
             use_hw=use_hw, bitrate=bitrate, codec=codec,
         )
 
     def describe(self, label):
         """One or more human-readable lines explaining this plan's decisions."""
-        fps_reason = "--fps override" if self.fps_is_override else "derived from webp frame timing, or 25 default if it has none"
         hw_reason = "hardware" if self.use_hw else "software"
         return [
-            f"  {label}: fps={self.fps:.2f} ({fps_reason})",
+            f"  {label}: fps={self.fps:.2f} ({self.fps_source})",
             f"  {label}: encoder={self.encoder} ({hw_reason}, codec={self.codec}, bitrate={self.bitrate})",
         ]
 
     def ffmpeg_cmd(self, width, height, output_path):
         """
-        >>> plan = EncodingPlan(25.0, False, "libx264", False, "5000k", "h264")
+        >>> plan = EncodingPlan(25.0, "webp frame timing", "libx264", False, "5000k", "h264")
         >>> plan.ffmpeg_cmd(100, 200, "out.mp4")
         ['ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo', '-s', '100x200', '-pix_fmt', 'rgba', '-r', '25.0', '-i', '-', '-c:v', 'libx264', '-preset', 'ultrafast', '-b:v', '5000k', '-pix_fmt', 'yuv420p', 'out.mp4']
         """
