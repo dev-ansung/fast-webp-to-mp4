@@ -10,10 +10,10 @@ This tool solves the problem by decoding frames via Pillow and streaming the raw
 
 * **Zero Disk I/O:** Frames are piped in memory (`-f rawvideo`), completely bypassing the overhead of zlib compression and disk writes.
 * **Hardware Acceleration:** Automatically detects and uses Apple's `h264_videotoolbox`/`hevc_videotoolbox` hardware encoders on supported Macs. Falls back to `libx264`/`libx265 -preset ultrafast` otherwise.
-* **Concurrent Processing:** Uses a producer/consumer threading model so Python can decode frame N+1 while FFmpeg encodes frame N. Optionally converts multiple files in parallel with `--jobs`.
-* **Correct Partial-Frame Handling:** Accurately detects WebPs that use region-diff (partial) frames and composites them onto a running canvas to prevent ghosted or corrupted output.
+* **Concurrent Processing:** Uses a producer/consumer threading model so Python can decode frame N+1 while FFmpeg encodes frame N. Batches of multiple files convert in parallel by default (one worker per CPU core), configurable with `--jobs`.
 * **Batch Processing:** Pass a directory to recursively find and convert all `*.webp` files instantly.
 * **Transparent Decisions:** Every choice the tool makes — hardware vs. software encoder, resolved fps, output location — is printed as it happens, not just at the end.
+* **Resilient Batches:** One corrupt or unreadable file is reported and skipped, not a fatal error for the whole run — including under `--jobs`.
 
 ## 🛠 Requirements
 
@@ -45,10 +45,11 @@ $ fast-webp-to-mp4 ./stickers
 Found 2 webp file(s).
 Codec: h264. Hardware encoder (h264_videotoolbox) available -> using hardware encoding.
 Converting stickers/wave.webp -> stickers/wave.mp4
-  wave.webp: fps=25.00 (derived from webp frame timing, or 25 default if it has none)
+  wave.webp: 25.00fps (default)
   wave.webp: encoder=h264_videotoolbox (hardware, codec=h264, bitrate=5000k)
+  wave.webp: done in 2.51s
   Skipping jump.mp4: already exists (use --force to overwrite)
-Done. 1 converted, 1 skipped, 0 failed.
+Done in 2.52s. 1 converted, 1 skipped, 0 failed.
 ```
 
 ## ⚙️ Options & Behavior
@@ -60,7 +61,7 @@ Done. 1 converted, 1 skipped, 0 failed.
 | `--bitrate STR` | Output video bitrate, e.g. `5000k` or `8M`. Default: `5000k`. Applies to both hardware and software encoders. |
 | `--codec {h264,hevc}` | Output video codec. Default: `h264`. `hevc` gives smaller files at similar quality if your player supports it. |
 | `--output-dir PATH` | Write all `.mp4` files here instead of next to each source, preserving the source directory structure underneath it. |
-| `--jobs, -j INT` | Convert this many files in parallel. Default: `1`. |
+| `--jobs, -j INT` | Convert this many files in parallel. Default: number of CPU cores. |
 
 **Overwrite behavior if an output `.mp4` already exists:**
 
@@ -79,7 +80,7 @@ Overwrite decisions are always resolved sequentially before any conversion start
 
 Want to know exactly how we shaved 19 seconds off the conversion time?
 
-* Read [WHY.md](WHY.md) for a deep dive into avoiding disk I/O, overcoming GIL bottlenecks with threaded pipes, and the dangers of naive partial-frame extraction.
+* Read [WHY.md](WHY.md) for a deep dive into avoiding disk I/O and overcoming GIL bottlenecks with threaded pipes.
 * See [benchmark.md](benchmark.md) for the detailed phase-by-phase performance breakdown and isolated `libwebp` decode floors.
 
 ## 🧪 Testing

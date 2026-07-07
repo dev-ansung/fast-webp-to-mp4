@@ -1,4 +1,5 @@
 import argparse
+import os
 import subprocess
 import sys
 import threading
@@ -19,10 +20,19 @@ def has_encoder(name):
     result = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True)
     return name in result.stdout
 
+def require_ffmpeg():
+    """Exit with a clear message if ffmpeg isn't on PATH, instead of a raw traceback later."""
+    try:
+        subprocess.run(["ffmpeg", "-version"], capture_output=True)
+    except FileNotFoundError:
+        print("Error: ffmpeg not found on PATH. Install ffmpeg and try again.", file=sys.stderr)
+        sys.exit(1)
+
 def frame_durations_ms(img):
     """
     Each frame's declared duration in milliseconds, or None for any frame
-    that has no timing metadata at all.
+    that has no timing metadata at all. A frame legitimately declaring a
+    duration of 0 is kept as 0, distinct from having no timing metadata.
 
     >>> class FakeFrame:
     ...     def __init__(self, duration): self.info = {"duration": duration}
@@ -33,12 +43,19 @@ def frame_durations_ms(img):
     ...     @property
     ...     def info(self): return self._cur.info
     >>> frame_durations_ms(FakeImg())
-    [40, None]
+    [40, 0]
+
+    >>> class NoDurationKeyImg:
+    ...     n_frames = 1
+    ...     def seek(self, i): pass
+    ...     info = {}
+    >>> frame_durations_ms(NoDurationKeyImg())
+    [None]
     """
     durations = []
     for i in range(getattr(img, "n_frames", 1)):
         img.seek(i)
-        durations.append(img.info.get("duration") or None)
+        durations.append(img.info.get("duration"))
     return durations
 
 def frame_rate(img):
@@ -67,7 +84,7 @@ def frame_rate(img):
     """
     durations = frame_durations_ms(img)
     has_timing = any(d is not None for d in durations)
-    avg_ms = sum(d or 40 for d in durations) / len(durations)
+    avg_ms = sum(40 if d is None else d for d in durations) / len(durations)
     fps = 1000.0 / avg_ms if avg_ms > 0 else 25.0
     return fps, has_timing
 
@@ -175,38 +192,48 @@ class EncodingPlan:
 
 def composited_frames(img):
     """
-    Yield each frame of an animated image as RGBA bytes, compositing
-    partial-frame updates onto a running canvas so files using region-diff
-    frames don't come out ghosted/corrupted.
+    Yield each frame of an animated image as RGBA bytes.
 
-    ImageSequence.Iterator (not a bare .seek() loop) is required for
-    frame.tile to be populated correctly.
+    PIL's webp plugin decodes frames via libwebp's WebPAnimDecoder, which
+    resolves frame disposal/blending internally and always hands back a
+    full, already-composited canvas-sized frame -- never a raw partial
+    region. So there is nothing left to composite here; each frame just
+    needs decoding. (Verified: frame.tile is always empty by the time a
+    frame reaches here, on every frame of every webp file tested.)
     """
-    width, height = img.size
-    canvas = Image.new("RGBA", (width, height))
     for frame in ImageSequence.Iterator(img):
-        if frame.tile and frame.tile[0][1][2:] != img.size:
-            canvas.paste(frame, (0, 0), frame.convert("RGBA"))
-        else:
-            canvas = frame.convert("RGBA")
-        yield canvas.tobytes()
+        yield frame.convert("RGBA").tobytes()
 
 class FfmpegPipe:
     """
     Runs one ffmpeg encode, fed by raw frame bytes pushed via write(), on a
     background thread so the caller can decode the next frame while this
-    one is still draining into ffmpeg's stdin.
+    one is still draining into ffmpeg's stdin. stderr is drained on its own
+    thread too -- ffmpeg can otherwise block writing to a full stderr pipe
+    while the stdin writer is blocked waiting for ffmpeg to keep reading,
+    deadlocking both sides.
     """
     def __init__(self, cmd):
         self.process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=10**8)
         self._queue = queue.Queue(maxsize=16)
-        self._thread = threading.Thread(target=self._drain)
-        self._thread.start()
+        self._write_error = None
+        self._stdin_thread = threading.Thread(target=self._drain_stdin)
+        self._stdin_thread.start()
+        self._stderr_chunks = []
+        self._stderr_thread = threading.Thread(target=self._drain_stderr)
+        self._stderr_thread.start()
 
-    def _drain(self):
-        while (data := self._queue.get()) is not None:
-            self.process.stdin.write(data)
-        self.process.stdin.close()
+    def _drain_stdin(self):
+        try:
+            while (data := self._queue.get()) is not None:
+                self.process.stdin.write(data)
+        except (BrokenPipeError, OSError) as e:
+            self._write_error = e
+        finally:
+            self.process.stdin.close()
+
+    def _drain_stderr(self):
+        self._stderr_chunks.append(self.process.stderr.read())
 
     def write(self, data):
         self._queue.put(data)
@@ -214,28 +241,42 @@ class FfmpegPipe:
     def close(self):
         """Signal no more frames, wait for ffmpeg to finish. Returns (ok, stderr_text)."""
         self._queue.put(None)
-        self._thread.join()
-        stderr = self.process.stderr.read()
+        self._stdin_thread.join()
+        self._stderr_thread.join()
         self.process.wait()
-        return self.process.returncode == 0, stderr.decode(errors="replace")
+        stderr = b"".join(self._stderr_chunks).decode(errors="replace")
+        if self._write_error and self.process.returncode == 0:
+            # ffmpeg exited 0 but our write to it failed earlier -- treat as a failure
+            return False, f"{stderr}\n(writer thread error: {self._write_error})"
+        return self.process.returncode == 0, stderr
 
 def convert_one(src_path, output_path, use_hw, fps_override=None, bitrate="5000k", codec="h264"):
-    """Convert a single animated webp file to mp4, streaming frames to ffmpeg via stdin."""
+    """
+    Convert a single animated webp file to mp4, streaming frames to ffmpeg via
+    stdin. Never raises -- any failure (corrupt source file, ffmpeg error) is
+    reported and returns False, so one bad file in a batch doesn't take down
+    every other conversion (especially under --jobs, where an uncaught
+    exception in one worker discards the results of all the others).
+    """
     start = time.monotonic()
-    img = Image.open(src_path)
-    width, height = img.size
+    try:
+        with Image.open(src_path) as img:
+            width, height = img.size
 
-    plan = EncodingPlan.resolve(img, use_hw, codec, bitrate, fps_override=fps_override)
-    for line in plan.describe(src_path.name):
-        print(line)
+            plan = EncodingPlan.resolve(img, use_hw, codec, bitrate, fps_override=fps_override)
+            for line in plan.describe(src_path.name):
+                print(line)
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    pipe = FfmpegPipe(plan.ffmpeg_cmd(width, height, output_path))
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            pipe = FfmpegPipe(plan.ffmpeg_cmd(width, height, output_path))
 
-    for frame_bytes in composited_frames(img):
-        pipe.write(frame_bytes)
+            for frame_bytes in composited_frames(img):
+                pipe.write(frame_bytes)
 
-    ok, stderr = pipe.close()
+            ok, stderr = pipe.close()
+    except Exception as e:
+        ok, stderr = False, f"{type(e).__name__}: {e}"
+
     elapsed = time.monotonic() - start
     if ok:
         print(f"  {src_path.name}: done in {elapsed:.2f}s")
@@ -289,7 +330,8 @@ def output_path_for(src, input_root, output_dir):
     """
     Where a source file's .mp4 should be written: next to the source by
     default, or under output_dir preserving the path relative to
-    input_root when --output-dir is given.
+    input_root when --output-dir is given. src is always expected to be
+    under input_root (every caller derives both from the same scan).
 
     No output_dir: written next to the source.
 
@@ -303,8 +345,7 @@ def output_path_for(src, input_root, output_dir):
     """
     if output_dir is None:
         return src.with_suffix(".mp4")
-    rel = src.relative_to(input_root) if src.is_relative_to(input_root) else src.name
-    return (output_dir / rel).with_suffix(".mp4")
+    return (output_dir / src.relative_to(input_root)).with_suffix(".mp4")
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Convert animated webp file(s) to mp4.")
@@ -314,7 +355,7 @@ def parse_args():
     parser.add_argument("--bitrate", default="5000k", help="Output video bitrate, e.g. 5000k or 8M (default: 5000k)")
     parser.add_argument("--codec", choices=list(CODEC_ENCODERS), default="h264", help="Output video codec (default: h264)")
     parser.add_argument("--output-dir", type=Path, default=None, help="Write all .mp4 files here (preserving directory structure) instead of next to each source file")
-    parser.add_argument("--jobs", "-j", type=int, default=1, help="Convert this many files in parallel (default: 1)")
+    parser.add_argument("--jobs", "-j", type=int, default=os.cpu_count() or 1, help="Convert this many files in parallel (default: number of CPUs)")
     return parser.parse_args()
 
 def plan_batch(sources, input_root, args):
@@ -353,6 +394,8 @@ def main():
         result = doctest.testmod()
         print(f"Doctests run: {result.attempted}, Failed: {result.failed}")
         sys.exit(1 if result.failed else 0)
+
+    require_ffmpeg()
 
     input_path = Path(args.input)
     sources = find_webp_files(input_path)

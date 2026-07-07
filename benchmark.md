@@ -65,18 +65,44 @@ before its timing was trusted:
 - Sampled frames at multiple timestamps show genuinely different pixel
   content (not a frozen first frame repeated)
 
-One additional check specific to this tool: partial-frame WebP detection
-was verified to actually trigger by walking frames with
-`ImageSequence.Iterator` and confirming `frame.tile` is populated — a
-naive `getattr(img, "tile", None)` check on a manually `.seek()`'d image
-was tested and found to never fire, regardless of file content, and was
-rejected during development for that reason.
+One additional check specific to this tool: a `frame.tile`-based
+partial-frame compositing path (meant to handle WebP files that store
+frames as region diffs) was tested directly and found to never fire on
+any frame of any file, via either a manual `.seek()` loop or
+`ImageSequence.Iterator`. PIL's webp plugin decodes via libwebp's
+`WebPAnimDecoder`, which resolves frame disposal/blending internally and
+always yields a complete, already-composited frame — so `tile` is always
+empty by the time Python code can see it. The compositing mechanism was
+removed; see WHY.md for the full story.
+
+## Batch parallelism (`--jobs`)
+
+Separate from single-file speed: converting a directory of files with
+multiple worker threads, on the same 10-core machine, with 8 real webp
+files (each similar to the one benchmarked above):
+
+| `--jobs` | Total time | Per-file time |
+|---|---|---|
+| 1 | 20.11s | ~2.5s each |
+| 4 | 10.93s | ~5.3–5.6s each |
+
+~1.84x faster at `--jobs 4`, not 4x -- per-file time roughly doubles
+under contention because PIL's frame decode is CPU-bound and holds the
+GIL, so worker threads partly serialize on that step; only the hardware
+encode (a separate process per file) truly parallelizes. `--jobs`
+defaults to `os.cpu_count()` on the strength of this result, since more
+workers than cores can't help further and the ~2x win is real even if
+sub-linear.
+
+All 8 outputs verified correct (matching duration/dimensions) in both
+runs before trusting the timing.
 
 ## Reproducing
 
 ```
 uv run fast_webp_to_mp4.py test        # correctness (doctests)
 time uv run fast_webp_to_mp4.py file.webp   # timing, on your own hardware/file
+time uv run fast_webp_to_mp4.py some_dir --jobs N   # batch timing at N workers
 ```
 
 Absolute numbers will vary by machine and source file (frame count,

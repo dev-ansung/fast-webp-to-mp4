@@ -55,29 +55,66 @@ across repeated runs. On machines without it, `libx264 -preset ultrafast`
 gets most of the same win (~2.9s) by skipping compression search steps
 that don't matter for a short clip — this tool auto-detects and falls back.
 
-## What it gets right that a naive rewrite of the above wouldn't
+## A dead end we walked into, and backed out of
 
-Some animated WebP files store frames as **partial updates** — only the
-changed region, not a full image. Decoding frames in isolation without
-compositing each partial frame onto the previous full frame produces
-ghosted, corrupted output. This is easy to get wrong two ways:
+Animated WebP can, in principle, store frames as **partial updates** —
+only the changed region, not a full image — which would need compositing
+onto a running canvas to avoid ghosted output. We built exactly that:
+detect a partial frame via `frame.tile`, composite it, else replace the
+canvas wholesale.
 
-- Skip the check entirely (most quick scripts do this) — silently
-  corrupts any file using partial frames.
-- Check for it with `getattr(img, "tile", None)` on a manually `.seek()`'d
-  image — looks reasonable, but `tile` isn't populated correctly outside
-  of `ImageSequence.Iterator`'s frame-walking order, so the check silently
-  never fires. We hit this exact bug during development and verified it
-  directly before it shipped.
+Two versions of that check shipped, in order:
 
-This tool walks frames via `ImageSequence.Iterator` (the API that actually
-populates `frame.tile` correctly) and composites partial frames onto a
-running canvas, so both full-frame and partial-frame WebP convert
-correctly — not just the common case.
+- `getattr(img, "tile", None)` on a manually `.seek()`'d image — looked
+  reasonable, but `tile` isn't populated that way at all, so the check
+  silently never fired.
+- The "fix": walk frames via `ImageSequence.Iterator` instead, which
+  looked like it should populate `frame.tile` correctly.
+
+Neither actually worked, and a later, closer look at PIL's own webp
+plugin source explains why: PIL decodes animated WebP through libwebp's
+`WebPAnimDecoder`, which resolves frame disposal and blending **inside
+libwebp itself** and always hands PIL a complete, already-composited,
+canvas-sized frame — never a raw partial region. `tile` gets set
+internally during `load()` and cleared again immediately after, so by
+the time any Python code inspects it, it's always empty. Confirmed on
+every single frame of the real 301-frame test file: the "partial" branch
+fired exactly 0 times.
+
+The compositing code wasn't a subtle bug fix that mostly worked — it was
+dead code that never ran, on any file, the entire time. The fix wasn't
+a smarter check; it was deleting the mechanism, because the problem it
+existed to solve was already solved one layer down, and we hadn't looked
+there yet.
+
+## Batches: parallel, but not linearly so
+
+Everything above is about converting *one* file as fast as possible. For a
+directory of files, the obvious next question is whether converting
+several at once is worth it. Tested on the real 8-file batch this tool
+was built for:
+
+| `--jobs` | Total time | Per-file time |
+|---|---|---|
+| 1 (sequential) | 20.11s | ~2.5s each |
+| 4 | 10.93s | ~5.3–5.6s each |
+
+`--jobs 4` is ~1.84x faster overall, not 4x. The reason is visible in the
+per-file time doubling under contention: PIL's frame decode is CPU-bound
+Python/C-extension work that holds the GIL, so N worker threads doing
+that concurrently partly serialize on it rather than truly running in
+parallel. Only the hardware encode step (a separate OS process per file)
+genuinely parallelizes across threads. Since more workers than there are
+CPU cores to actually run them can't help and only adds contention,
+`--jobs` now defaults to the machine's CPU count rather than 1 — a
+worthwhile default given the real, if sub-linear, speedup measured above,
+but not a promise of linear scaling with job count.
 
 ## Net result
 
-~8.5x faster than the naive PNG-per-frame approach (22.3s → ~2.6s),
-arrived at by profiling each phase rather than assuming — and correct on
-a class of file (partial-frame WebP) that a faster-but-naive version of
-this same pipe-based approach would silently mishandle.
+~8.5x faster than the naive PNG-per-frame approach (22.3s → ~2.6s) for a
+single file, and close to another 2x on top of that for a batch of many
+files processed in parallel — arrived at by profiling each phase rather
+than assuming, and one fewer mechanism to maintain after confirming,
+rather than assuming, that the partial-frame compositing code was never
+doing anything.
