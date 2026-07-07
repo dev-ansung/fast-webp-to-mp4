@@ -152,7 +152,7 @@ class EncodingPlan:
         """One or more human-readable lines explaining this plan's decisions."""
         hw_reason = "hardware" if self.use_hw else "software"
         return [
-            f"  {label}: fps={self.fps:.2f} ({self.fps_source})",
+            f"  {label}: {self.fps:.2f}fps ({self.fps_source})",
             f"  {label}: encoder={self.encoder} ({hw_reason}, codec={self.codec}, bitrate={self.bitrate})",
         ]
 
