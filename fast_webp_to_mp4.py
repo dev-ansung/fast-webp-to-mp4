@@ -310,24 +310,24 @@ def convert_one(src_path, output_path, use_hw, fps_override=None, bitrate="5000k
         print(f"  {src_path.name}: failed after {elapsed:.2f}s: {stderr}", file=sys.stderr)
     return ok
 
-def should_write(output_path, force, non_interactive):
+def should_write(output_path, skip, non_interactive):
     """
-    Decide whether it's OK to write output_path, per --force / existing-file /
+    Decide whether it's OK to write output_path, per --skip / existing-file /
     interactivity rules.
 
     >>> import tempfile, os
     >>> with tempfile.TemporaryDirectory() as d:
     ...     p = Path(d) / "missing.mp4"
-    ...     should_write(p, force=False, non_interactive=True)
+    ...     should_write(p, skip=False, non_interactive=True)
     True
     """
     if not output_path.exists():
         return True
-    if force:
-        return True
-    if non_interactive:
-        print(f"  Skipping {output_path.name}: already exists (use --force to overwrite)")
+    if skip:
+        print(f"  Skipping {output_path.name}: already exists")
         return False
+    if non_interactive:
+        return True
     answer = input(f"  {output_path.name} already exists. Overwrite? [y/N] ")
     return answer.strip().lower() == "y"
 
@@ -376,7 +376,7 @@ def output_path_for(src, input_root, output_dir):
 def parse_args():
     parser = argparse.ArgumentParser(description="Convert animated webp file(s) to mp4.")
     parser.add_argument("input", help="A .webp file, or a directory (searched recursively for *.webp), or 'test' to run inline tests.")
-    parser.add_argument("--force", action="store_true", help="Overwrite existing output files without prompting")
+    parser.add_argument("--skip", action="store_true", help="Skip converting WebP files if the output MP4 already exists")
     parser.add_argument("--fps", type=float, default=None, help="Output frame rate (default: derived from the webp's own frame timing, or 25 if it has none)")
     parser.add_argument("--bitrate", default="5000k", help="Output video bitrate, e.g. 5000k or 8M (default: 5000k)")
     parser.add_argument("--codec", choices=list(CODEC_ENCODERS), default="h264", help="Output video codec (default: h264)")
@@ -395,7 +395,7 @@ def plan_batch(sources, input_root, args):
     skipped = 0
     for src in sources:
         output_path = output_path_for(src, input_root, args.output_dir)
-        if should_write(output_path, args.force, non_interactive):
+        if should_write(output_path, args.skip, non_interactive):
             to_convert.append((src, output_path))
         else:
             skipped += 1

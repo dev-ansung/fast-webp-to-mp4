@@ -48,7 +48,7 @@ Converting stickers/wave.webp -> stickers/wave.mp4
   wave.webp: 25.00fps (default)
   wave.webp: encoder=h264_videotoolbox (hardware, codec=h264, bitrate=5000k)
   wave.webp: done in 2.51s
-  Skipping jump.mp4: already exists (use --force to overwrite)
+  Skipping jump.mp4: already exists
 Done in 2.52s. 1 converted, 1 skipped, 0 failed.
 ```
 
@@ -56,7 +56,7 @@ Done in 2.52s. 1 converted, 1 skipped, 0 failed.
 
 | Flag | Effect |
 | --- | --- |
-| `--force` | Overwrite existing output files without prompting. |
+| `--skip` | Skip converting WebP files if the output MP4 already exists. |
 | `--fps FLOAT` | Output frame rate. Default: derived from the webp's own frame timing, or 25 if it has none. |
 | `--bitrate STR` | Output video bitrate, e.g. `5000k` or `8M`. Default: `5000k`. Applies to both hardware and software encoders. |
 | `--codec {h264,hevc}` | Output video codec. Default: `h264`. `hevc` gives smaller files at similar quality if your player supports it. |
@@ -65,9 +65,9 @@ Done in 2.52s. 1 converted, 1 skipped, 0 failed.
 
 **Overwrite behavior if an output `.mp4` already exists:**
 
-* **Interactive terminal:** You will be prompted with `Overwrite? [y/N]` per file.
-* **Non-interactive / Scripted:** The file is safely skipped and logged in the final summary so it never blocks waiting for input.
-* **Using `--force`:** Always overwrites, bypassing prompts and skips.
+* **Interactive terminal:** You will be prompted with `Overwrite? [y/N]` per file, unless `--skip` is enabled.
+* **Non-interactive / Scripted:** Overwrites by default, unless `--skip` is enabled.
+* **Using `--skip`:** Always skips existing files, bypassing prompts and overwrites.
 
 Overwrite decisions are always resolved sequentially before any conversion starts (even with `--jobs > 1`), so an interactive prompt never races with a background conversion.
 
