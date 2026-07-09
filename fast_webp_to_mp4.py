@@ -28,7 +28,7 @@ def require_ffmpeg():
         print("Error: ffmpeg not found on PATH. Install ffmpeg and try again.", file=sys.stderr)
         sys.exit(1)
 
-def frame_durations_ms(img):
+def frame_durations_ms(img, src_path=None):
     """
     Each frame's declared duration in milliseconds, or None for any frame
     that has no timing metadata at all. A frame legitimately declaring a
@@ -52,13 +52,39 @@ def frame_durations_ms(img):
     >>> frame_durations_ms(NoDurationKeyImg())
     [None]
     """
+    if src_path is not None:
+        try:
+            with open(src_path, "rb") as f:
+                data = f.read()
+            if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+                durations = []
+                offset = 12
+                while offset < len(data):
+                    chunk_id = data[offset:offset+4]
+                    if len(chunk_id) < 4:
+                        break
+                    chunk_size = int.from_bytes(data[offset+4:offset+8], "little")
+                    padded_size = chunk_size + (chunk_size % 2)
+                    
+                    if chunk_id == b"ANMF":
+                        # Duration is a 24-bit little-endian integer at offset 12 of the payload
+                        dur_bytes = data[offset+20:offset+23]
+                        dur = int.from_bytes(dur_bytes, "little")
+                        durations.append(dur)
+                        
+                    offset += 8 + padded_size
+                if durations:
+                    return durations
+        except Exception:
+            pass
+
     durations = []
     for i in range(getattr(img, "n_frames", 1)):
         img.seek(i)
         durations.append(img.info.get("duration"))
     return durations
 
-def frame_rate(img):
+def frame_rate(img, src_path=None):
     """
     Average fps across all frames' declared durations, and whether that
     timing metadata actually existed (vs. every frame missing it, forcing
@@ -82,13 +108,13 @@ def frame_rate(img):
     >>> frame_rate(NoTimingImg())
     (25.0, False)
     """
-    durations = frame_durations_ms(img)
+    durations = frame_durations_ms(img, src_path=src_path)
     has_timing = any(d is not None for d in durations)
     avg_ms = sum(40 if d is None else d for d in durations) / len(durations)
     fps = 1000.0 / avg_ms if avg_ms > 0 else 25.0
     return fps, has_timing
 
-def resolve_fps(img, fps_override=None):
+def resolve_fps(img, src_path=None, fps_override=None):
     """
     Output fps and whether it came from an override, the webp's own
     timing, or the no-timing-metadata fallback.
@@ -111,7 +137,7 @@ def resolve_fps(img, fps_override=None):
     """
     if fps_override:
         return fps_override, "--fps override"
-    fps, has_timing = frame_rate(img)
+    fps, has_timing = frame_rate(img, src_path=src_path)
     source = "webp frame timing" if has_timing else "default"
     return fps, source
 
@@ -158,8 +184,8 @@ class EncodingPlan:
     codec: str
 
     @classmethod
-    def resolve(cls, img, use_hw, codec, bitrate, fps_override=None):
-        fps, fps_source = resolve_fps(img, fps_override=fps_override)
+    def resolve(cls, img, use_hw, codec, bitrate, src_path=None, fps_override=None):
+        fps, fps_source = resolve_fps(img, src_path=src_path, fps_override=fps_override)
         return cls(
             fps=fps, fps_source=fps_source,
             encoder=resolve_encoder(use_hw, codec),
@@ -263,7 +289,7 @@ def convert_one(src_path, output_path, use_hw, fps_override=None, bitrate="5000k
         with Image.open(src_path) as img:
             width, height = img.size
 
-            plan = EncodingPlan.resolve(img, use_hw, codec, bitrate, fps_override=fps_override)
+            plan = EncodingPlan.resolve(img, use_hw, codec, bitrate, src_path=src_path, fps_override=fps_override)
             for line in plan.describe(src_path.name):
                 print(line)
 
